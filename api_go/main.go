@@ -2,47 +2,38 @@
 package main
 
 import (
-	"encoding/json" // Para codificar e decodificar JSON
-	"fmt"           // Para formatação de strings (impressão)
-	"log"           // Para logs de erro e informações
-	"net/http"      // Para criar o servidor HTTP e manipular requisições
-	"sync"          // Para garantir a segurança de acesso a dados compartilhados (mutex)
-	//"time"          // Para lidar com tempo, útil para timestamps
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time" // Re-importado para manipulação de datas
 )
 
-// DadoSGS representa a estrutura de um dado de série temporal recebido do Rust.
-// Os campos são tagsadas com `json:"..."` para mapear os nomes do JSON.
+// DadoSGS representa a estrutura de um dado de série temporal.
 type DadoSGS struct {
-	Data  string `json:"data"`  // Data do dado (ex: "01/01/2024")
-	Valor string `json:"valor"` // Valor do indicador (ex: "5.25")
+	Data  string `json:"data"`
+	Valor string `json:"valor"`
 }
 
-// GlobalDataStore simula um armazenamento em memória para os dados do SGS.
-// Em um sistema real, isso seria um banco de dados (ex: PostgreSQL, SQLite).
-// Um RWMutex é usado para controlar o acesso concorrente aos dados,
-// permitindo múltiplos leitores ou um único escritor por vez.
+// GlobalDataStore simula um armazenamento em memória.
 type GlobalDataStore struct {
-	mu    sync.RWMutex             // Mutex para proteção de acesso concorrente
-	dados map[string][]DadoSGS // Mapa: chave (código série) -> lista de dados
-	// Ex: {"433": [{Data: "...", Valor: "..."}, ...]}
+	mu    sync.RWMutex
+	dados map[string][]DadoSGS
 }
 
-// nossoDataStore é a instância global do armazenamento de dados.
 var nossoDataStore = GlobalDataStore{
 	dados: make(map[string][]DadoSGS),
 }
 
-// handleReceiveData recebe dados financeiros do módulo Rust via POST.
+// handleReceiveData permanece o mesmo
 func handleReceiveData(w http.ResponseWriter, r *http.Request) {
-	// Garante que a requisição é um POST.
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método não permitido. Use POST.", http.StatusMethodNotAllowed)
 		log.Printf("Erro: Tentativa de acesso com método não permitido: %s", r.Method)
 		return
 	}
 
-	// Define uma variável para decodificar o JSON recebido.
-	// O Rust enviará um mapa com códigos de série e suas respectivas listas de DadosSGS.
 	var dadosRecebidos map[string][]DadoSGS
 	err := json.NewDecoder(r.Body).Decode(&dadosRecebidos)
 	if err != nil {
@@ -51,68 +42,123 @@ func handleReceiveData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Protege o acesso ao armazenamento global com um Mutex para escrita.
 	nossoDataStore.mu.Lock()
-	defer nossoDataStore.mu.Unlock() // Garante que o mutex será liberado ao final da função.
+	defer nossoDataStore.mu.Unlock()
 
-	// Atualiza os dados no armazenamento. Para este exemplo, substituímos os dados existentes.
-	// Em um cenário real, você poderia mergear, inserir no banco de dados, etc.
 	for codigo, listaDados := range dadosRecebidos {
+		// Para simplificar, estamos substituindo a lista inteira.
+		// Em um cenário real, você faria um merge ou inseriria no DB, tratando duplicatas.
 		nossoDataStore.dados[codigo] = listaDados
 		log.Printf("Dados para série %s atualizados. Total de %d itens.", codigo, len(listaDados))
 	}
 
-	w.WriteHeader(http.StatusOK) // Retorna status 200 OK
+	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Dados recebidos e processados com sucesso!")
 	log.Println("Dados recebidos e processados com sucesso do Rust.")
 }
 
-// handleGetIndicators expõe os dados financeiros armazenados via GET para o módulo Dart.
+// handleGetIndicators agora aceita e filtra por data.
 func handleGetIndicators(w http.ResponseWriter, r *http.Request) {
-	// Garante que a requisição é um GET.
+	// --- ADICIONE ESTES CABEÇALHOS CORS NO INÍCIO DO HANDLER ---
+	// Permite requisições de qualquer origem. Em produção, você restringiria isso a origens específicas.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// Permite os métodos HTTP que seu cliente Flutter usará (GET, POST, etc.)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	// Permite cabeçalhos específicos
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With")
+
+	// Lida com requisições OPTIONS (pré-voo CORS)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// -------------------------------------------------------------
+
 	if r.Method != http.MethodGet {
 		http.Error(w, "Método não permitido. Use GET.", http.StatusMethodNotAllowed)
 		log.Printf("Erro: Tentativa de acesso com método não permitido: %s", r.Method)
 		return
 	}
 
-	// Protege o acesso ao armazenamento global com um RLock (leitura).
-	nossoDataStore.mu.RLock()
-	defer nossoDataStore.mu.RUnlock() // Garante que o RWMutex será liberado.
+	query := r.URL.Query()
+	dataInicialStr := query.Get("dataInicial")
+	dataFinalStr := query.Get("dataFinal")
 
-	// Verifica se há dados disponíveis.
+	var dataInicial time.Time
+	var dataFinal time.Time
+	var err error
+
+	const dateFormat = "02/01/2006"
+
+	if dataInicialStr != "" {
+		dataInicial, err = time.Parse(dateFormat, dataInicialStr)
+		if err != nil {
+			http.Error(w, "Formato de dataInicial inválido. Use DD/MM/AAAA.", http.StatusBadRequest)
+			log.Printf("Erro ao parsear dataInicial '%s': %v", dataInicialStr, err)
+			return
+		}
+	} else {
+		dataInicial = time.Time{}
+	}
+
+	if dataFinalStr != "" {
+		dataFinal, err = time.Parse(dateFormat, dataFinalStr)
+		if err != nil {
+			http.Error(w, "Formato de dataFinal inválido. Use DD/MM/AAAA.", http.StatusBadRequest)
+			log.Printf("Erro ao parsear dataFinal '%s': %v", dataFinalStr, err)
+			return
+		}
+		dataFinal = dataFinal.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+	} else {
+		dataFinal = time.Now().Add(365 * 24 * time.Hour)
+	}
+
+	nossoDataStore.mu.RLock()
+	defer nossoDataStore.mu.RUnlock()
+
 	if len(nossoDataStore.dados) == 0 {
 		http.Error(w, "Nenhum dado financeiro disponível no momento.", http.StatusNotFound)
 		log.Println("Erro: Nenhuns dados financeiros disponíveis para o Dart.")
 		return
 	}
 
-	// Define o cabeçalho Content-Type para indicar que a resposta é JSON.
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK) // Retorna status 200 OK
+	filteredData := make(map[string][]DadoSGS)
 
-	// Codifica os dados armazenados como JSON e os escreve na resposta HTTP.
-	err := json.NewEncoder(w).Encode(nossoDataStore.dados)
+	for codigo, dados := range nossoDataStore.dados {
+		var serieFiltrada []DadoSGS
+		for _, dado := range dados {
+			dadoTime, err := time.Parse(dateFormat, dado.Data)
+			if err != nil {
+				log.Printf("Aviso: Falha ao parsear data do dado '%s' para série %s: %v. Dado ignorado.", dado.Data, codigo, err)
+				continue
+			}
+
+			if (dadoTime.Equal(dataInicial) || dadoTime.After(dataInicial)) &&
+				(dadoTime.Equal(dataFinal) || dadoTime.Before(dataFinal)) {
+				serieFiltrada = append(serieFiltrada, dado)
+			}
+		}
+		if len(serieFiltrada) > 0 {
+			filteredData[codigo] = serieFiltrada
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(filteredData)
 	if err != nil {
 		log.Printf("Erro ao codificar JSON para resposta: %v", err)
-		// Já escrevemos o cabeçalho, então não podemos usar http.Error novamente,
-		// apenas registrar o erro.
 	}
-	log.Println("Dados financeiros enviados para o Dart.")
+	log.Println("Dados financeiros filtrados e enviados para o Dart.")
 }
 
 func main() {
-	// Configura as rotas do servidor HTTP.
-	// "/dados/sgs" para receber dados do Rust.
 	http.HandleFunc("/dados/sgs", handleReceiveData)
-	// "/api/v1/indicadores" para expor dados ao Dart.
 	http.HandleFunc("/api/v1/indicadores", handleGetIndicators)
 
-	// Inicia o servidor HTTP na porta 8080.
 	port := ":8080"
 	log.Printf("Servidor Go iniciado na porta %s. Aguardando requisições...", port)
-	// log.Fatal(http.ListenAndServe(port, nil)) inicia o servidor e bloqueia.
-	// Se houver um erro ao iniciar o servidor, ele será logado e o programa encerrará.
 	err := http.ListenAndServe(port, nil)
 	if err != nil {
 		log.Fatalf("Erro ao iniciar o servidor Go: %v", err)
