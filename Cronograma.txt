@@ -3,3 +3,5 @@
 2. Inicio do desenvolvimento em rust (Coleta dos dados)
 
 3. Inicio do desenvolvimento em Go (tratamento dos dados)
+
+4. Integração 
